@@ -672,3 +672,48 @@ func (api *fakeAPI) RunGetMethod(ctx context.Context, blockInfo *ton.BlockIDExt,
 	}
 	return ton.NewExecutionResult([]any{providers, balance}), nil
 }
+
+func TestProviderAllowsArchiveBagWithoutTelemetry(t *testing.T) {
+	prv := &Provider{}
+	if providerAllowsArchiveBag(prv, 100<<30, 90) {
+		t.Fatal("providers without telemetry must be skipped")
+	}
+
+	prv = &Provider{HasProviderSpaceTelemetry: true, TotalProviderSpaceGB: 0}
+	if providerAllowsArchiveBag(prv, 1<<30, 90) {
+		t.Fatal("providers with non-positive total space must be skipped")
+	}
+}
+
+func TestProviderAllowsArchiveBagRespectsFillPercent(t *testing.T) {
+	prv := &Provider{
+		HasProviderSpaceTelemetry: true,
+		TotalProviderSpaceGB:      100,
+		UsedProviderSpaceGB:       80,
+	}
+
+	// 80 + 5 = 85 <= 90
+	if !providerAllowsArchiveBag(prv, 5<<30, 90) {
+		t.Fatal("expected bag within 90% fill to be allowed")
+	}
+	// 80 + 15 = 95 > 90
+	if providerAllowsArchiveBag(prv, 15<<30, 90) {
+		t.Fatal("expected bag exceeding 90% fill to be rejected")
+	}
+}
+
+func TestReserveProviderSpaceTracksUsageInLoop(t *testing.T) {
+	prv := &Provider{
+		HasProviderSpaceTelemetry: true,
+		TotalProviderSpaceGB:      100,
+		UsedProviderSpaceGB:       80,
+	}
+
+	if !providerAllowsArchiveBag(prv, 5<<30, 90) {
+		t.Fatal("first bag should fit")
+	}
+	reserveProviderSpace(prv, 5<<30)
+	if providerAllowsArchiveBag(prv, 6<<30, 90) {
+		t.Fatalf("second bag should not fit after reserve, used=%.2f", prv.UsedProviderSpaceGB)
+	}
+}
