@@ -1446,7 +1446,7 @@ func sendManyWaitTransactionFresh(ctx context.Context, wl loopWallet, api ton.AP
 	if err != nil {
 		return nil, nil, err
 	}
-	if err = api.SendExternalMessage(ctx, ext); err != nil {
+	if err = sendExternalMessageToAllLiteservers(ctx, api, ext); err != nil {
 		return nil, nil, fmt.Errorf("failed to send message: %w", err)
 	}
 
@@ -1456,6 +1456,49 @@ func sendManyWaitTransactionFresh(ctx context.Context, wl loopWallet, api ton.AP
 		Msg("sent external message, waiting for wallet transaction")
 
 	return waitForWalletInMsg(ctx, api, wl.WalletAddress(), inMsgHash, master.SeqNo+1)
+}
+
+// sendExternalMessageToAllLiteservers broadcasts the same external message BOC to every
+// available lite server. Dedup is safe: one body hash / highload query id.
+// Succeeds if at least one lite server accepts the message.
+func sendExternalMessageToAllLiteservers(ctx context.Context, api ton.APIClientWrapped, msg *tlb.ExternalMessage) error {
+	stickyCtx := api.Client().StickyContext(ctx)
+
+	accepted := 0
+	tried := 0
+	var lastErr error
+	for {
+		tried++
+		nodeID := api.Client().StickyNodeID(stickyCtx)
+
+		reqCtx, cancel := context.WithTimeout(stickyCtx, liteserverRequestTimeout)
+		err := api.SendExternalMessage(reqCtx, msg)
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			log.Warn().Err(err).Uint32("ls_node_id", nodeID).Msg("failed to send external message to lite server")
+		} else {
+			accepted++
+			log.Debug().Uint32("ls_node_id", nodeID).Msg("external message accepted by lite server")
+		}
+
+		nextCtx, err := api.Client().StickyContextNextNode(stickyCtx)
+		if err != nil {
+			break
+		}
+		stickyCtx = nextCtx
+	}
+
+	if accepted == 0 {
+		if lastErr != nil {
+			return lastErr
+		}
+		return fmt.Errorf("no lite server accepted external message")
+	}
+
+	log.Debug().Int("accepted", accepted).Int("tried", tried).Msg("external message broadcast to lite servers")
+	return nil
 }
 
 func waitForWalletInMsg(ctx context.Context, api ton.APIClientWrapped, addr *address.Address, inMsgHash []byte, minSeqno uint32) (*tlb.Transaction, *ton.BlockIDExt, error) {
