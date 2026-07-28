@@ -43,6 +43,11 @@ type Provider struct {
 	ID            []byte
 	BagsNum       int
 	WaitingForBag string
+
+	// Provider space from mytonprovider telemetry (GB). Required to assign archive bags.
+	HasProviderSpaceTelemetry bool
+	TotalProviderSpaceGB      float64
+	UsedProviderSpaceGB       float64
 }
 
 type StatBag struct {
@@ -63,7 +68,11 @@ type StatProvider struct {
 
 type MTPResponse struct {
 	Providers []struct {
-		PubKey string `json:"pubkey"`
+		PubKey    string `json:"pubkey"`
+		Telemetry struct {
+			TotalProviderSpace *float32 `json:"total_provider_space"`
+			UsedProviderSpace  *float32 `json:"used_provider_space"`
+		} `json:"telemetry"`
 	} `json:"providers"`
 }
 
@@ -90,6 +99,7 @@ const (
 	defaultLimitProviders            = 100
 	defaultReplicas                  = 3
 	defaultMaxBagsPerProvider        = 10
+	defaultMaxProviderFillPercent    = 90
 	defaultEnableStats               = false
 	defaultNoTx                      = false
 	defaultNoRemoveBag               = false
@@ -113,6 +123,7 @@ var limitBags = flag.Int("limit-bags", defaultLimitBags, "Limit for bags to proc
 var limitProviders = flag.Int("limit-providers", defaultLimitProviders, "Limit for providers filter request (all fetched within single request)")
 var replicas = flag.Int("replicas", defaultReplicas, "Providers per bag")
 var maxBagsPerProvider = flag.Int("max-bags-per-provider", defaultMaxBagsPerProvider, "Max bags per provider")
+var maxProviderFillPercent = flag.Int("max-provider-fill-percent", defaultMaxProviderFillPercent, "Max provider storage fill percent of total space from telemetry; providers without telemetry are skipped (0-100)")
 var enableStats = flag.Bool("enable-stats", defaultEnableStats, "Enable stats write to csv")
 var noTx = flag.Bool("no-tx", defaultNoTx, "Disable transactions")
 var noRemoveBag = flag.Bool("no-remove-bag", defaultNoRemoveBag, "Not remove bag after header save")
@@ -152,6 +163,7 @@ type serviceConfig struct {
 	LimitProviders            int    `json:"limit_providers"`
 	Replicas                  int    `json:"replicas"`
 	MaxBagsPerProvider        int    `json:"max_bags_per_provider"`
+	MaxProviderFillPercent    int    `json:"max_provider_fill_percent"`
 	EnableStats               bool   `json:"enable_stats"`
 	NoTx                      bool   `json:"no_tx"`
 	NoRemoveBag               bool   `json:"no_remove_bag"`
@@ -174,6 +186,7 @@ var legacyConfigJSONNames = map[string]string{
 	"limit-bags":                   "limit_bags",
 	"limit-providers":              "limit_providers",
 	"max-bags-per-provider":        "max_bags_per_provider",
+	"max-provider-fill-percent":    "max_provider_fill_percent",
 	"enable-stats":                 "enable_stats",
 	"no-tx":                        "no_tx",
 	"no-remove-bag":                "no_remove_bag",
@@ -198,6 +211,7 @@ func defaultServiceConfig() serviceConfig {
 		LimitProviders:            defaultLimitProviders,
 		Replicas:                  defaultReplicas,
 		MaxBagsPerProvider:        defaultMaxBagsPerProvider,
+		MaxProviderFillPercent:    defaultMaxProviderFillPercent,
 		EnableStats:               defaultEnableStats,
 		NoTx:                      defaultNoTx,
 		NoRemoveBag:               defaultNoRemoveBag,
@@ -223,6 +237,7 @@ func currentServiceConfig() serviceConfig {
 		LimitProviders:            *limitProviders,
 		Replicas:                  *replicas,
 		MaxBagsPerProvider:        *maxBagsPerProvider,
+		MaxProviderFillPercent:    *maxProviderFillPercent,
 		EnableStats:               *enableStats,
 		NoTx:                      *noTx,
 		NoRemoveBag:               *noRemoveBag,
@@ -247,6 +262,7 @@ func applyServiceConfig(cfg serviceConfig) {
 	*limitProviders = cfg.LimitProviders
 	*replicas = cfg.Replicas
 	*maxBagsPerProvider = cfg.MaxBagsPerProvider
+	*maxProviderFillPercent = cfg.MaxProviderFillPercent
 	*enableStats = cfg.EnableStats
 	*noTx = cfg.NoTx
 	*noRemoveBag = cfg.NoRemoveBag
@@ -364,6 +380,9 @@ func applyFlagOverrides(cfg *serviceConfig, explicit map[string]bool) {
 	}
 	if explicit["max-bags-per-provider"] {
 		cfg.MaxBagsPerProvider = flagCfg.MaxBagsPerProvider
+	}
+	if explicit["max-provider-fill-percent"] {
+		cfg.MaxProviderFillPercent = flagCfg.MaxProviderFillPercent
 	}
 	if explicit["enable-stats"] {
 		cfg.EnableStats = flagCfg.EnableStats
@@ -799,9 +818,13 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 			continue
 		}
 
-		providers = append(providers, &Provider{
-			ID: key,
-		})
+		prv := &Provider{ID: key}
+		if p.Telemetry.TotalProviderSpace != nil && p.Telemetry.UsedProviderSpace != nil {
+			prv.HasProviderSpaceTelemetry = true
+			prv.TotalProviderSpaceGB = float64(*p.Telemetry.TotalProviderSpace)
+			prv.UsedProviderSpaceGB = float64(*p.Telemetry.UsedProviderSpace)
+		}
+		providers = append(providers, prv)
 	}
 
 	log.Info().Msg("checking bags num stored")
@@ -1026,6 +1049,21 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 					continue
 				}
 
+				if !prv.HasProviderSpaceTelemetry || prv.TotalProviderSpaceGB <= 0 {
+					log.Debug().Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("provider has no space telemetry, skip")
+					continue
+				}
+				if !providerAllowsArchiveBag(prv, dt.BagSize, *maxProviderFillPercent) {
+					log.Debug().
+						Str("bag", dt.BagID).
+						Hex("provider", prv.ID).
+						Float64("used_gb", prv.UsedProviderSpaceGB).
+						Float64("total_gb", prv.TotalProviderSpaceGB).
+						Int("fill_percent", *maxProviderFillPercent).
+						Msg("provider fill limit reached, skip")
+					continue
+				}
+
 				for _, newProvider := range newProviders {
 					if bytes.Equal(prv.ID, newProvider.Address.Data()) {
 						// already exists
@@ -1085,6 +1123,7 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 				log.Info().Str("bag", dt.BagID).Hex("provider", prv.ID).Str("per_mb_day", perMB.String()).Msg("adding new provider")
 
 				prv.BagsNum++
+				reserveProviderSpace(prv, dt.BagSize)
 				newProviders = append(newProviders, contract.ProviderV1{
 					Address:       address.NewAddress(0, 0, prv.ID),
 					MaxSpan:       offer.Span,
@@ -1593,6 +1632,35 @@ func exportStatsToCSV(providerStats []*StatProvider, bagStats []*StatBag, provid
 	}
 
 	return nil
+}
+
+func bytesToGB(size uint64) float64 {
+	return float64(size) / (1024 * 1024 * 1024)
+}
+
+// providerAllowsArchiveBag reports whether assigning bagSizeBytes keeps provider
+// usage at or below fillPercent of total_provider_space from telemetry.
+// Providers without space telemetry are rejected.
+func providerAllowsArchiveBag(prv *Provider, bagSizeBytes uint64, fillPercent int) bool {
+	if prv == nil || !prv.HasProviderSpaceTelemetry || prv.TotalProviderSpaceGB <= 0 {
+		return false
+	}
+	if fillPercent <= 0 {
+		fillPercent = 100
+	}
+	if fillPercent > 100 {
+		fillPercent = 100
+	}
+
+	limitGB := prv.TotalProviderSpaceGB * float64(fillPercent) / 100
+	return prv.UsedProviderSpaceGB+bytesToGB(bagSizeBytes) <= limitGB
+}
+
+func reserveProviderSpace(prv *Provider, bagSizeBytes uint64) {
+	if prv == nil || !prv.HasProviderSpaceTelemetry {
+		return
+	}
+	prv.UsedProviderSpaceGB += bytesToGB(bagSizeBytes)
 }
 
 func initWallet(apiClient wallet.TonAPI, key ed25519.PrivateKey) (*wallet.Wallet, error) {
