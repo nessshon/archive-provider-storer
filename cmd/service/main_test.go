@@ -484,9 +484,15 @@ func newLoopHTTPServer(t *testing.T, bagID string, providerKeys [][]byte, provid
 		}
 		providerRequests.Add(1)
 
-		list := make([]map[string]string, 0, len(providerKeys))
+		list := make([]map[string]any, 0, len(providerKeys))
 		for _, key := range providerKeys {
-			list = append(list, map[string]string{"pubkey": hex.EncodeToString(key)})
+			list = append(list, map[string]any{
+				"pubkey": hex.EncodeToString(key),
+				"telemetry": map[string]float32{
+					"total_provider_space": 1000,
+					"used_provider_space":  0,
+				},
+			})
 		}
 		if err := json.NewEncoder(w).Encode(map[string]any{"providers": list}); err != nil {
 			t.Errorf("failed to write providers response: %v", err)
@@ -673,6 +679,88 @@ func (api *fakeAPI) RunGetMethod(ctx context.Context, blockInfo *ton.BlockIDExt,
 		balance = big.NewInt(0)
 	}
 	return ton.NewExecutionResult([]any{providers, balance}), nil
+}
+
+type fakeStickyLiteClient struct {
+	remainingAfterFirst int
+	curr                uint32
+}
+
+func (c *fakeStickyLiteClient) QueryLiteserver(ctx context.Context, payload tl.Serializable, result tl.Serializable) error {
+	return nil
+}
+
+func (c *fakeStickyLiteClient) StickyContext(ctx context.Context) context.Context {
+	c.curr = 1
+	return ctx
+}
+
+func (c *fakeStickyLiteClient) StickyContextNextNode(ctx context.Context) (context.Context, error) {
+	if c.remainingAfterFirst <= 0 {
+		return ctx, liteclient.ErrNoNodesLeft
+	}
+	c.remainingAfterFirst--
+	c.curr++
+	return ctx, nil
+}
+
+func (c *fakeStickyLiteClient) StickyContextNextNodeBalanced(ctx context.Context) (context.Context, error) {
+	return c.StickyContextNextNode(ctx)
+}
+
+func (c *fakeStickyLiteClient) StickyNodeID(ctx context.Context) uint32 {
+	return c.curr
+}
+
+type fakeBroadcastAPI struct {
+	ton.APIClientWrapped
+	client   *fakeStickyLiteClient
+	sendErrs []error
+	calls    int
+}
+
+func (api *fakeBroadcastAPI) Client() ton.LiteClient {
+	return api.client
+}
+
+func (api *fakeBroadcastAPI) SendExternalMessage(ctx context.Context, msg *tlb.ExternalMessage) error {
+	i := api.calls
+	api.calls++
+	if i < len(api.sendErrs) {
+		return api.sendErrs[i]
+	}
+	return nil
+}
+
+func TestSendExternalMessageToAllLiteserversAcceptsPartialSuccess(t *testing.T) {
+	api := &fakeBroadcastAPI{
+		client:   &fakeStickyLiteClient{remainingAfterFirst: 2}, // 3 nodes total
+		sendErrs: []error{errors.New("ls1 down"), nil, errors.New("ls3 down")},
+	}
+
+	err := sendExternalMessageToAllLiteservers(context.Background(), api, &tlb.ExternalMessage{})
+	if err != nil {
+		t.Fatalf("expected success when at least one LS accepts, got: %v", err)
+	}
+	if api.calls != 3 {
+		t.Fatalf("expected 3 send attempts, got %d", api.calls)
+	}
+}
+
+func TestSendExternalMessageToAllLiteserversFailsWhenAllReject(t *testing.T) {
+	want := errors.New("all down")
+	api := &fakeBroadcastAPI{
+		client:   &fakeStickyLiteClient{remainingAfterFirst: 1}, // 2 nodes total
+		sendErrs: []error{want, want},
+	}
+
+	err := sendExternalMessageToAllLiteservers(context.Background(), api, &tlb.ExternalMessage{})
+	if !errors.Is(err, want) {
+		t.Fatalf("expected last error %v, got %v", want, err)
+	}
+	if api.calls != 2 {
+		t.Fatalf("expected 2 send attempts, got %d", api.calls)
+	}
 }
 
 func TestProviderAllowsArchiveBagWithoutTelemetry(t *testing.T) {
