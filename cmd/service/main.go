@@ -59,11 +59,12 @@ type StatBag struct {
 }
 
 type StatProvider struct {
-	ID               string
-	BagsNum          int
-	WaitingForBag    string
-	ProofLongTimeAgo bool
-	TotalPerDay      *big.Int
+	ID                string
+	BagsNum           int
+	WaitingForBag     string
+	ProofLongTimeAgo  bool
+	NotInProviderList bool
+	TotalPerDay       *big.Int
 }
 
 type MTPResponse struct {
@@ -142,6 +143,10 @@ var (
 	bagHeaderWaitTimeout  = 60 * time.Second
 	bagHeaderPollInterval = 500 * time.Millisecond
 )
+
+// mtpProvidersCache holds the last successful full MTP provider pubkey set (hex)
+// used only for stats (Not in provider list). In-memory; replaced on each successful fetch.
+var mtpProvidersCache map[string]struct{}
 
 type freshWalletAPI struct {
 	ton.APIClientWrapped
@@ -827,6 +832,10 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 		providers = append(providers, prv)
 	}
 
+	if *enableStats {
+		refreshMTPProvidersCache(deps.httpClient, providersUrl)
+	}
+
 	log.Info().Msg("checking bags num stored")
 
 	for _, dt := range details {
@@ -891,6 +900,13 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 
 				if !ps.ProofLongTimeAgo && !cp.LastProofAt.Before(oldUnix) {
 					ps.ProofLongTimeAgo = cp.LastProofAt.Before(time.Now().Add(-time.Duration(cp.MaxSpan) * time.Second))
+				}
+
+				if len(mtpProvidersCache) > 0 {
+					_, inList := mtpProvidersCache[hex.EncodeToString(cp.Key)]
+					ps.NotInProviderList = !inList
+				} else {
+					ps.NotInProviderList = false
 				}
 
 				sb := bagStats[dt.BagID]
@@ -1630,6 +1646,37 @@ func liteserverAddr(ls liteclient.LiteserverConfig) string {
 	)
 }
 
+func refreshMTPProvidersCache(httpClient *http.Client, providersUrl string) {
+	resp, err := httpClient.Post(providersUrl, "application/json", bytes.NewBuffer([]byte(`{
+		"filters": {},
+		"exact": [],
+		"limit": 1000,
+		"offset": 0
+	}`)))
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to fetch all MTP providers for stats, using fallback cache")
+		return
+	}
+	defer resp.Body.Close()
+
+	var list MTPResponse
+	if err = json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		log.Warn().Err(err).Msg("failed to decode all MTP providers for stats, using fallback cache")
+		return
+	}
+
+	next := make(map[string]struct{}, len(list.Providers))
+	for _, p := range list.Providers {
+		key, err := hex.DecodeString(p.PubKey)
+		if err != nil {
+			continue
+		}
+		next[hex.EncodeToString(key)] = struct{}{}
+	}
+	mtpProvidersCache = next
+	log.Info().Int("providers", len(next)).Msg("refreshed MTP providers cache for stats")
+}
+
 func exportStatsToCSV(providerStats []*StatProvider, bagStats []*StatBag, providerFilePath, bagFilePath string) error {
 	providerFile, err := os.Create(providerFilePath)
 	if err != nil {
@@ -1640,7 +1687,7 @@ func exportStatsToCSV(providerStats []*StatProvider, bagStats []*StatBag, provid
 	providerWriter := csv.NewWriter(providerFile)
 	defer providerWriter.Flush()
 
-	err = providerWriter.Write([]string{"Provider ID", "Bags Num", "Waiting download", "Proof long time ago", "Per day"})
+	err = providerWriter.Write([]string{"Provider ID", "Bags Num", "Waiting download", "Proof long time ago", "Not in provider list", "Per day"})
 	if err != nil {
 		return fmt.Errorf("failed to write provider stats header: %w", err)
 	}
@@ -1650,7 +1697,8 @@ func exportStatsToCSV(providerStats []*StatProvider, bagStats []*StatBag, provid
 			p.ID,
 			fmt.Sprint(p.BagsNum),
 			fmt.Sprint(p.WaitingForBag),
-			fmt.Sprint(!p.ProofLongTimeAgo),
+			fmt.Sprint(p.ProofLongTimeAgo),
+			fmt.Sprint(p.NotInProviderList),
 			tlb.FromNanoTON(p.TotalPerDay).String(),
 		})
 		if err != nil {
