@@ -144,10 +144,6 @@ var (
 	bagHeaderPollInterval = 500 * time.Millisecond
 )
 
-// mtpProvidersCache holds the last successful full MTP provider pubkey set (hex)
-// used only for stats (Not in provider list). In-memory; replaced on each successful fetch.
-var mtpProvidersCache map[string]struct{}
-
 type freshWalletAPI struct {
 	ton.APIClientWrapped
 }
@@ -832,8 +828,11 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 		providers = append(providers, prv)
 	}
 
+	trustedProviders := make(map[string]struct{}, len(providers))
 	if *enableStats {
-		refreshMTPProvidersCache(deps.httpClient, providersUrl)
+		for _, p := range providers {
+			trustedProviders[hex.EncodeToString(p.ID)] = struct{}{}
+		}
 	}
 
 	log.Info().Msg("checking bags num stored")
@@ -902,12 +901,8 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 					ps.ProofLongTimeAgo = cp.LastProofAt.Before(time.Now().Add(-time.Duration(cp.MaxSpan) * time.Second))
 				}
 
-				if len(mtpProvidersCache) > 0 {
-					_, inList := mtpProvidersCache[hex.EncodeToString(cp.Key)]
-					ps.NotInProviderList = !inList
-				} else {
-					ps.NotInProviderList = false
-				}
+				_, inList := trustedProviders[hex.EncodeToString(cp.Key)]
+				ps.NotInProviderList = !inList
 
 				sb := bagStats[dt.BagID]
 				if sb == nil {
@@ -1644,37 +1639,6 @@ func liteserverAddr(ls liteclient.LiteserverConfig) string {
 		ls.IP&0xff,
 		ls.Port,
 	)
-}
-
-func refreshMTPProvidersCache(httpClient *http.Client, providersUrl string) {
-	resp, err := httpClient.Post(providersUrl, "application/json", bytes.NewBuffer([]byte(`{
-		"filters": {},
-		"exact": [],
-		"limit": 1000,
-		"offset": 0
-	}`)))
-	if err != nil {
-		log.Warn().Err(err).Msg("failed to fetch all MTP providers for stats, using fallback cache")
-		return
-	}
-	defer resp.Body.Close()
-
-	var list MTPResponse
-	if err = json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		log.Warn().Err(err).Msg("failed to decode all MTP providers for stats, using fallback cache")
-		return
-	}
-
-	next := make(map[string]struct{}, len(list.Providers))
-	for _, p := range list.Providers {
-		key, err := hex.DecodeString(p.PubKey)
-		if err != nil {
-			continue
-		}
-		next[hex.EncodeToString(key)] = struct{}{}
-	}
-	mtpProvidersCache = next
-	log.Info().Int("providers", len(next)).Msg("refreshed MTP providers cache for stats")
 }
 
 func exportStatsToCSV(providerStats []*StatProvider, bagStats []*StatBag, providerFilePath, bagFilePath string) error {
