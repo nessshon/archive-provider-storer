@@ -17,6 +17,7 @@ import (
 
 	"github.com/xssnick/archive-manager/pkg/index"
 	"github.com/xssnick/tonutils-go/address"
+	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -805,5 +806,27 @@ func TestReserveProviderSpaceTracksUsageInLoop(t *testing.T) {
 	reserveProviderSpace(prv, 5<<30)
 	if providerAllowsArchiveBag(prv, 6<<30, 90) {
 		t.Fatalf("second bag should not fit after reserve, used=%.2f", prv.UsedProviderSpaceGB)
+	}
+}
+
+func TestIsDHTLookupTimeout(t *testing.T) {
+	// non-converging lookup: counts as our-side degradation
+	timeout := fmt.Errorf("failed to connect to provider: %w",
+		fmt.Errorf("failed to find storage-provider in dht of aabb: %w", context.DeadlineExceeded))
+	if !isDHTLookupTimeout(timeout) {
+		t.Fatal("dht lookup timeout not detected")
+	}
+
+	// converged lookup, record absent: provider's fault, must not count
+	notFound := fmt.Errorf("failed to connect to provider: %w",
+		fmt.Errorf("failed to find storage-provider in dht of aabb: %w", dht.ErrDHTValueIsNotFound))
+	if isDHTLookupTimeout(notFound) {
+		t.Fatal("converged not-found wrongly counted as lookup timeout")
+	}
+
+	// timeout after connect (rldp query): provider reachable but slow, must not count
+	rldp := fmt.Errorf("failed to do request: %w", context.DeadlineExceeded)
+	if isDHTLookupTimeout(rldp) {
+		t.Fatal("post-connect timeout wrongly counted as lookup timeout")
 	}
 }

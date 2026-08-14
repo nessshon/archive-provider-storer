@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -567,8 +568,41 @@ func main() {
 	})
 
 	var fromBlock uint32 = 0
+	dhtTimeoutLoops := 0
 	for {
 		fromBlock, err = doLoop(wl, cl, pClient, api, *indexUrl, "https://mytonprovider.org/api/v1/providers/search", fromBlock)
+
+		if len(dhtLookupTimeouts) > 0 {
+			dhtTimeoutLoops++
+		} else {
+			dhtTimeoutLoops = 0
+		}
+		if len(dhtLookupTimeouts) >= dhtDegradedThreshold || dhtTimeoutLoops >= dhtDegradedLoops {
+			// our dht routing state degraded, rebuild the client - same effect as a process restart, keys are ephemeral
+			log.Warn().Int("providers", len(dhtLookupTimeouts)).Int("loops", dhtTimeoutLoops).Msg("dht lookups not converging, recreating dht client")
+			if _, newDhtKey, kerr := ed25519.GenerateKey(nil); kerr != nil {
+				log.Error().Err(kerr).Msg("failed to generate new dht key, keeping old dht client")
+			} else {
+				newGate := adnl.NewGateway(newDhtKey)
+				if gerr := newGate.StartClient(); gerr != nil {
+					log.Error().Err(gerr).Msg("failed to start new dht gateway, keeping old dht client")
+				} else if newDht, derr := dht.NewClientFromConfig(newGate, lsCfg); derr != nil {
+					newGate.Close()
+					log.Error().Err(derr).Msg("failed to create new dht client, keeping old one")
+				} else {
+					// close deferred, notify goroutines from the finished loop still use the old client for ~20s
+					old := dhtClient
+					time.AfterFunc(30*time.Second, old.Close)
+					dhtClient = newDht
+					pClient = transport.NewClient(providerGate, dhtClient)
+					dhtTimeoutLoops = 0
+				}
+			}
+		}
+		for k := range dhtLookupTimeouts {
+			delete(dhtLookupTimeouts, k)
+		}
+
 		if err != nil {
 			log.Error().Err(err).Msg("failed to do loop")
 			time.Sleep(5 * time.Second)
@@ -582,6 +616,21 @@ func main() {
 }
 
 var addedProviders = make(map[string]time.Time)
+
+// providers whose dht lookup timed out without converging - our client's problem,
+// not proof the provider is gone (unlike a converged ErrDHTValueIsNotFound)
+var dhtLookupTimeouts = make(map[string]struct{})
+
+// recreate the dht client when lookups for this many providers didn't converge
+// in one loop, or at least one didn't converge this many loops in a row
+const (
+	dhtDegradedThreshold = 3
+	dhtDegradedLoops     = 2
+)
+
+func isDHTLookupTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && strings.Contains(err.Error(), " in dht of ")
+}
 
 func doLoop(wl *wallet.Wallet, storageClient *storage.Client, providerClient *transport.Client, api ton.APIClientWrapped, idxUrl, providersUrl string, fromBlock uint32) (uint32, error) {
 	return doLoopWithDeps(loopDeps{
@@ -981,6 +1030,9 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 				stResp, err := deps.provider.RequestStorageInfo(ctx, prv.Key, addr, toProof)
 				cancel()
 				if err != nil {
+					if isDHTLookupTimeout(err) {
+						dhtLookupTimeouts[string(prv.Key)] = struct{}{}
+					}
 					noRespCache[string(prv.Key)] = true
 					suspect = true
 					log.Warn().Err(err).Str("bag", dt.BagID).Hex("provider", prv.Key).Msg("failed to get storage info")
@@ -1002,8 +1054,12 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 					}
 				}
 
+				// if our own dht lookup didn't converge, we have no evidence the provider is
+				// gone - keep it and retry next loop with a healthy client
+				_, lookupTimedOut := dhtLookupTimeouts[string(prv.Key)]
+
 				maxDelay := time.Duration(prv.MaxSpan*2) * time.Second
-				if prv.LastProofAt.Add(maxDelay).Before(time.Now()) && time.Since(addedProviders[base64.StdEncoding.EncodeToString(prv.Key)+"_"+dt.BagID]) > 2*time.Hour {
+				if !lookupTimedOut && prv.LastProofAt.Add(maxDelay).Before(time.Now()) && time.Since(addedProviders[base64.StdEncoding.EncodeToString(prv.Key)+"_"+dt.BagID]) > 2*time.Hour {
 					existsInList := false
 					for _, p := range providers {
 						if bytes.Equal(prv.Key, p.ID) {
@@ -1104,6 +1160,9 @@ func doLoopWithDeps(deps loopDeps, idxUrl, providersUrl string, fromBlock uint32
 				rates, err := deps.provider.GetStorageRates(ctx, prv.ID, dt.BagSize)
 				cancel()
 				if err != nil {
+					if isDHTLookupTimeout(err) {
+						dhtLookupTimeouts[string(prv.ID)] = struct{}{}
+					}
 					noRespCache[string(prv.ID)] = true
 					log.Error().Err(err).Str("bag", dt.BagID).Hex("provider", prv.ID).Msg("failed to get rates")
 					continue
